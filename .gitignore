@@ -1,0 +1,16 @@
+# Node
+node_modules/
+dist/
+
+# Rust / Cargo build output
+src-tauri/target/
+
+# Tauri generated files
+src-tauri/gen/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/settings.json

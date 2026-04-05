@@ -1,0 +1,26 @@
+[package]
+name        = "decibel-counter"
+version     = "0.1.0"
+edition     = "2021"
+description = "Transparent gaming overlay that shows live microphone dB level"
+
+# The lib target lets Tauri's mobile scaffolding (and unit tests) compile the
+# app logic independently of the binary entry-point.
+[lib]
+name        = "decibel_counter_lib"
+crate-type  = ["staticlib", "cdylib", "rlib"]
+
+# ── Build-time ────────────────────────────────────────────────────────────────
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+# ── Runtime ───────────────────────────────────────────────────────────────────
+[dependencies]
+tauri      = { version = "2", features = [] }
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# cpal 0.15 — cross-platform real-time audio I/O
+cpal = "0.15"
+
+# WASAPI is the default cpal backend on Windows — no feature flag needed.
