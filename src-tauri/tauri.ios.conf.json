@@ -1,0 +1,17 @@
+{
+  "app": {
+    "windows": [
+      {
+        "label":       "main",
+        "title":       "dB Meter",
+        "width":       390,
+        "height":      844,
+        "resizable":   true,
+        "decorations": true,
+        "transparent": false,
+        "alwaysOnTop": false,
+        "fullscreen":  false
+      }
+    ]
+  }
+}

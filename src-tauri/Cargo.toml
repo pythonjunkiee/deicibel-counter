@@ -21,6 +21,10 @@ serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # cpal 0.15 — cross-platform real-time audio I/O
-cpal = "0.15"
+# oboe-shared-stdcxx: links against the shared C++ STL required on Android API 21+.
+# On non-Android targets this feature flag is a no-op.
+cpal = { version = "0.15", features = ["oboe-shared-stdcxx"] }
 
 # WASAPI is the default cpal backend on Windows — no feature flag needed.
+# CoreAudio is the default on macOS and iOS.
+# AAudio/Oboe is the default on Android (API 26+), falling back to OpenSL ES.

@@ -1,0 +1,22 @@
+{
+  "app": {
+    "windows": [
+      {
+        "label":       "main",
+        "title":       "dB Meter",
+        "width":       400,
+        "height":      700,
+        "resizable":   true,
+        "decorations": true,
+        "transparent": false,
+        "alwaysOnTop": false,
+        "fullscreen":  false
+      }
+    ]
+  },
+  "bundle": {
+    "android": {
+      "minSdkVersion": 24
+    }
+  }
+}
