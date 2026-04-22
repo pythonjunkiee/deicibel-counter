@@ -109,18 +109,15 @@ jobs:
 
       - run: npm ci
 
-      - name: Init Android project (first time only — idempotent)
+      - name: Init Android project
         run: npm run tauri android init
         env:
           NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/26.1.10909125
 
-      - name: Patch AndroidManifest — microphone permission
-        # Injects RECORD_AUDIO before </manifest> if not already present.
-        run: |
-          MANIFEST="src-tauri/gen/android/app/src/main/AndroidManifest.xml"
-          if ! grep -q "RECORD_AUDIO" "$MANIFEST"; then
-            sed -i 's|</manifest>|    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />\n    <uses-feature android:name="android.hardware.microphone" android:required="true" />\n</manifest>|' "$MANIFEST"
-          fi
+      - name: Apply Android patches
+        # Injects all permissions, PiP config, runtime permission requests,
+        # and creates DbMeterService.kt as a foreground service.
+        run: python3 android-patches/apply_patches.py
 
       - name: Build APK (debug — no keystore needed)
         run: npm run tauri android build -- --debug

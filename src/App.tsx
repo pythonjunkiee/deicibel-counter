@@ -38,8 +38,15 @@ const MICRO_H = 80;
 // macOS reserves ~28 logical px at the top of a decorations:false window for
 // the traffic-light button area. Add this to every setSize call so content
 // is never clipped at the bottom. Zero on all other platforms.
-const IS_MACOS = /Macintosh|MacIntel|MacPPC|Mac68K/i.test(navigator.userAgent);
+const IS_MACOS   = /Macintosh|MacIntel|MacPPC|Mac68K/i.test(navigator.userAgent);
+const IS_ANDROID = /Android/i.test(navigator.userAgent);
 const MACOS_EXTRA_H = IS_MACOS ? 28 : 0;
+
+// On desktop the root element must be transparent (Tauri overlay).
+// On Android the React component owns its own opaque background.
+if (!IS_ANDROID) {
+  document.documentElement.classList.add("tauri-desktop");
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -204,6 +211,18 @@ export default function App() {
   const calibIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const calibStartRef    = useRef(0);
   const positionSaveRef  = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // ── Picture-in-Picture detection (Android only) ────────────────────────────
+  // When Android puts the app into PiP the window shrinks to ~150×150px.
+  // Switch to the compact micro widget so it fits and looks good.
+  const [isPiP, setIsPiP] = useState(false);
+  useEffect(() => {
+    if (!IS_ANDROID) return;
+    const check = () => setIsPiP(window.innerWidth < 250 || window.innerHeight < 250);
+    check();
+    window.addEventListener("resize", check);
+    return () => window.removeEventListener("resize", check);
+  }, []);
 
   // ── Persist threshold ──────────────────────────────────────────────────────
   useEffect(() => {
@@ -441,8 +460,8 @@ export default function App() {
     Math.ceil(CALIBRATION_DURATION_MS / 1000 - (calibProgress / 100) * (CALIBRATION_DURATION_MS / 1000))
   );
 
-  // ── Micro widget ───────────────────────────────────────────────────────────
-  if (widgetMode === "micro") {
+  // ── Micro widget (desktop) or PiP mode (Android) ──────────────────────────
+  if (widgetMode === "micro" || (IS_ANDROID && isPiP)) {
     return (
       <MicroWidget
         db={displayDb}
@@ -452,6 +471,211 @@ export default function App() {
         micError={micError}
         onExpand={toggleWidgetMode}
       />
+    );
+  }
+
+  // ── Android full-screen layout ─────────────────────────────────────────────
+  // The desktop widget (320×310 px) doesn't suit a phone screen.
+  // This layout fills the full viewport with a mobile-optimised HUD.
+  if (IS_ANDROID) {
+    return (
+      <div
+        className="flex flex-col w-screen font-mono select-none"
+        style={{
+          minHeight: "100dvh",
+          background:
+            isAlerting && !isCalibrating && !isConfirming
+              ? "rgba(20,8,8,1)"
+              : "rgba(10,12,20,1)",
+          color: "#e5e7eb",
+        }}
+      >
+        {/* safe-area top (notch / status bar) */}
+        <div style={{ height: "env(safe-area-inset-top,0px)" }} />
+
+        {/* Title bar */}
+        <div
+          className="flex items-center justify-between px-5 py-3 border-b"
+          style={{ borderColor: "rgba(255,255,255,0.08)" }}
+        >
+          <div className="flex items-center gap-2">
+            {micError ? (
+              <MicOff size={15} className="text-red-500" />
+            ) : isMuted ? (
+              <MicOff size={15} className="text-amber-400" />
+            ) : isCalibrating ? (
+              <Mic size={15} className="text-cyan-400 animate-pulse" />
+            ) : (
+              <Mic size={15} className={isAlerting ? "text-red-400" : "text-cyan-400"} />
+            )}
+            <span className="text-xs tracking-[0.2em] uppercase text-gray-500">
+              {isCalibrating ? "Calibrating" : isConfirming ? "Review result" : "dB Meter"}
+            </span>
+          </div>
+          <div className="flex items-center gap-1">
+            {!micError && !isCalibrating && !isConfirming && (
+              <button
+                onClick={handleMuteToggle}
+                className={["p-2 rounded-xl transition-colors", isMuted ? "bg-amber-500/20 text-amber-400" : "text-gray-500 hover:text-gray-300"].join(" ")}
+              >
+                {isMuted ? <VolumeX size={18} /> : <Volume2 size={18} />}
+              </button>
+            )}
+            {!isCalibrating && !isConfirming && (
+              <button
+                onClick={toggleSettings}
+                className={["p-2 rounded-xl transition-colors", showSettings ? "bg-cyan-500/20 text-cyan-400" : "text-gray-500 hover:text-gray-300"].join(" ")}
+              >
+                <Settings size={18} />
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Main content */}
+        <div className="flex-1 flex flex-col items-center justify-center px-6 gap-8">
+
+          {/* Calibration recording phase */}
+          {isCalibrating && (
+            <div className="w-full space-y-5">
+              <div className="flex items-center justify-between">
+                <span className="text-sm text-cyan-400 tracking-widest uppercase animate-pulse">Listening…</span>
+                <span className="text-5xl font-bold tabular-nums text-cyan-400">
+                  {secondsLeft}<span className="text-sm text-gray-600 ml-1">s</span>
+                </span>
+              </div>
+              <div className="h-3 rounded-full overflow-hidden" style={{ background: "rgba(255,255,255,0.06)" }}>
+                <div className="h-full rounded-full transition-[width] duration-100" style={{ width: `${calibProgress}%`, background: "linear-gradient(to right,#164e63,#22d3ee,#2dd4bf)" }} />
+              </div>
+              <div className="text-center text-gray-500">Live: <span className="font-bold" style={{ color: accentColor }}>{displayDb} dB</span></div>
+            </div>
+          )}
+
+          {/* Calibration confirmation phase */}
+          {isConfirming && pendingResult && (
+            <div className="w-full space-y-5">
+              <div className="rounded-2xl p-5 space-y-3" style={{ background: "rgba(34,211,238,0.06)", border: "1px solid rgba(34,211,238,0.15)" }}>
+                <p className="text-xs uppercase tracking-widest text-cyan-600">Detected range</p>
+                <div className="flex justify-between">
+                  {([["Min", Math.round(pendingResult.min), "#d1d5db"], ["Avg", Math.round(pendingResult.mean), "#22d3ee"], ["Max", Math.round(pendingResult.max), "#d1d5db"], ["Suggested", Math.round(pendingResult.threshold), "#fbbf24"]] as [string, number, string][]).map(([label, val, color]) => (
+                    <div key={label} className="text-center">
+                      <div className="text-xs text-gray-600">{label}</div>
+                      <div className="text-2xl font-bold tabular-nums" style={{ color }}>{val}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="space-y-2">
+                <div className="flex justify-between items-center">
+                  <span className="text-xs text-gray-600 uppercase tracking-widest">Warn me at</span>
+                  <span className="font-bold text-amber-400">{pendingThreshold} dB</span>
+                </div>
+                <input type="range" min={SCALE_MIN} max={SCALE_MAX} step={1} value={pendingThreshold}
+                  onChange={(e) => setPendingThreshold(Number(e.target.value))} className="w-full" />
+              </div>
+              <div className="flex gap-3">
+                <button onClick={handleAcceptCalib} className="flex-1 py-4 rounded-2xl font-semibold flex items-center justify-center gap-2"
+                  style={{ background: "rgba(52,211,153,0.12)", border: "1px solid rgba(52,211,153,0.35)", color: "#34d399" }}>
+                  <Check size={16} /> Apply
+                </button>
+                <button onClick={() => handleRedoCalib(pendingResult.mode)} className="flex-1 py-4 rounded-2xl font-semibold flex items-center justify-center gap-2"
+                  style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.1)", color: "#6b7280" }}>
+                  <RotateCcw size={16} /> Redo
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Normal HUD */}
+          {!isCalibrating && !isConfirming && (
+            <>
+              <div className="flex flex-col items-center gap-3">
+                <span
+                  key={shakeKey.current}
+                  className={["font-bold tabular-nums tracking-tight", isAlerting ? "animate-shake" : ""].join(" ")}
+                  style={{ fontSize: "clamp(80px,20vw,120px)", color: micError ? "#4b5563" : isMuted ? "rgba(245,158,11,0.5)" : accentColor, lineHeight: 1 }}
+                >
+                  {micError ? "--" : displayDb}
+                </span>
+                <span className="text-xl text-gray-500 tracking-widest">dB</span>
+                {micError ? (
+                  <button onClick={handleRetry} className="flex items-center gap-2 px-6 py-3 rounded-2xl font-semibold text-cyan-400"
+                    style={{ border: "1px solid rgba(8,145,178,0.4)", background: "rgba(8,145,178,0.1)" }}>
+                    <RefreshCw size={16} /> Retry Microphone
+                  </button>
+                ) : (
+                  <span className="px-5 py-1.5 rounded-full font-semibold tracking-widest uppercase"
+                    style={{
+                      border: isMuted ? "1px solid rgba(245,158,11,0.4)" : isAlerting ? "1px solid rgba(239,68,68,0.4)" : "1px solid rgba(52,211,153,0.4)",
+                      background: isMuted ? "rgba(245,158,11,0.1)" : isAlerting ? "rgba(239,68,68,0.12)" : "rgba(52,211,153,0.1)",
+                      color: isMuted ? "#fbbf24" : isAlerting ? "#f87171" : "#34d399",
+                    }}>
+                    {isMuted ? "MUTED" : isAlerting ? "TOO LOUD" : displayDb > threshold * 0.8 ? "LOUD" : "OK"}
+                  </span>
+                )}
+              </div>
+
+              {/* Meter bar */}
+              <div className="w-full space-y-2">
+                <div className="relative h-5 rounded-full overflow-visible" style={{ background: "rgba(255,255,255,0.06)" }}>
+                  <div className={`absolute inset-y-0 left-0 rounded-full bg-gradient-to-r ${gradClass} transition-[width] duration-75`} style={{ width: `${barPct}%` }} />
+                  {displayPeak > 0 && (
+                    <div className="absolute top-1/2 -translate-y-1/2 w-[3px] h-6 rounded-full" style={{ left: `calc(${peakPct}% - 1.5px)`, background: "rgba(251,191,36,0.7)" }} />
+                  )}
+                  <div className="absolute top-1/2 -translate-y-1/2 w-[3px] h-7 rounded-full" style={{ left: `calc(${thresholdPct}% - 1.5px)`, background: "rgba(255,255,255,0.5)" }} />
+                </div>
+                <div className="flex justify-between text-sm text-gray-600">
+                  <span>0</span>
+                  <span style={{ color: isAlerting ? "#dc2626" : "#6b7280" }}>▲ {threshold} dB</span>
+                  <span>100</span>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* Settings bottom sheet */}
+        {showSettings && !isCalibrating && !isConfirming && (
+          <div className="border-t px-6 py-5 space-y-5 overflow-y-auto" style={{ borderColor: "rgba(255,255,255,0.08)", maxHeight: "55vh" }}>
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs uppercase tracking-widest text-gray-600">Input device</span>
+                {deviceSwitching && <span className="text-xs text-cyan-500 animate-pulse">switching…</span>}
+              </div>
+              <select value={selectedDevice} onChange={(e) => handleDeviceChange(e.target.value)}
+                className="w-full rounded-xl text-sm px-3 py-3 outline-none"
+                style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "#d1d5db" }}>
+                <option value="">System Default</option>
+                {devices.map((d) => <option key={d} value={d}>{d}</option>)}
+              </select>
+            </div>
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs uppercase tracking-widest text-gray-600">Alert threshold</span>
+                <span className="font-bold text-cyan-400">{threshold} dB</span>
+              </div>
+              <input type="range" min={SCALE_MIN} max={SCALE_MAX} step={1} value={threshold}
+                onChange={(e) => setThreshold(Number(e.target.value))} className="w-full" />
+            </div>
+            <div className="space-y-3 pt-3 border-t" style={{ borderColor: "rgba(255,255,255,0.06)" }}>
+              <p className="text-xs uppercase tracking-widest text-gray-600">Auto-calibrate (10 s)</p>
+              <button onClick={() => startCalib("normal")} disabled={micError}
+                className="w-full py-4 rounded-2xl font-semibold flex items-center justify-center gap-2 transition-colors"
+                style={{ border: "1px solid rgba(8,145,178,0.4)", background: "rgba(8,145,178,0.08)", color: "#22d3ee" }}>
+                <Mic size={16} /> Speak normally → set threshold above
+              </button>
+              <button onClick={() => startCalib("limit")} disabled={micError}
+                className="w-full py-4 rounded-2xl font-semibold flex items-center justify-center gap-2 transition-colors"
+                style={{ border: "1px solid rgba(245,158,11,0.4)", background: "rgba(245,158,11,0.08)", color: "#fbbf24" }}>
+                <Zap size={16} /> Speak at your limit → set threshold there
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* safe-area bottom */}
+        <div style={{ height: "env(safe-area-inset-bottom,0px)" }} />
+      </div>
     );
   }
 

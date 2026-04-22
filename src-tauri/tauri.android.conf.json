@@ -4,19 +4,17 @@
       {
         "label":       "main",
         "title":       "dB Meter",
-        "width":       400,
-        "height":      700,
+        "fullscreen":  true,
         "resizable":   true,
-        "decorations": true,
+        "decorations": false,
         "transparent": false,
-        "alwaysOnTop": false,
-        "fullscreen":  false
+        "alwaysOnTop": false
       }
     ]
   },
   "bundle": {
     "android": {
-      "minSdkVersion": 24
+      "minSdkVersion": 26
     }
   }
 }

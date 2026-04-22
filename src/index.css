@@ -14,12 +14,16 @@
 html,
 body,
 #root {
+  width: 100%;
   height: 100%;
-  /* IMPORTANT: must be transparent so the Tauri transparent window works */
-  background: transparent !important;
   overflow: hidden;
-  /* Disable text selection across the whole overlay */
   user-select: none;
+}
+
+/* Desktop overlay: must be transparent so the Tauri window shows through.
+   Android sets its own opaque background in the React component. */
+.tauri-desktop {
+  background: transparent !important;
 }
 
 /* ── Alert glow animation ────────────────────────────────────────────────── */
