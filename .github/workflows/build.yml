@@ -127,13 +127,16 @@ jobs:
         env:
           NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/26.1.10909125
 
+      - name: Locate and copy APK to known path
+        run: |
+          mkdir -p apk-out
+          find src-tauri/gen/android -name "*.apk" | head -1 | xargs -I{} cp {} apk-out/dB-Meter.apk
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: android-apk
-          # User downloads this .apk, taps it on their Android phone,
-          # enables "Install unknown apps" once in Settings, done.
-          path: src-tauri/gen/android/app/build/outputs/apk/debug/*.apk
+          path: apk-out/dB-Meter.apk
 
   # ── GitHub Release — attach all artifacts when a tag is pushed ──
   release:
