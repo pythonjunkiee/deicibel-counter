@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { getCurrentWindow, PhysicalPosition } from "@tauri-apps/api/window";
+import { getCurrentWindow, LogicalSize, PhysicalPosition } from "@tauri-apps/api/window";
 import {
   Check,
   GripHorizontal,
+  Maximize2,
   Mic,
   MicOff,
+  Minimize2,
   RefreshCw,
   RotateCcw,
   Settings,
@@ -26,6 +28,19 @@ const ALERT_LATCH_MS = 750;
 const PEAK_HOLD_MS = 2000;
 const CALIBRATION_DURATION_MS = 10_000;
 
+// Window dimensions
+const FULL_W = 320;
+const FULL_H = 310;       // height when settings panel is closed
+const FULL_H_OPEN = 490;  // height when settings panel is open
+const MICRO_W = 80;
+const MICRO_H = 80;
+
+// macOS reserves ~28 logical px at the top of a decorations:false window for
+// the traffic-light button area. Add this to every setSize call so content
+// is never clipped at the bottom. Zero on all other platforms.
+const IS_MACOS = /Macintosh|MacIntel|MacPPC|Mac68K/i.test(navigator.userAgent);
+const MACOS_EXTRA_H = IS_MACOS ? 28 : 0;
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 interface DbPayload {
@@ -42,6 +57,7 @@ interface CalibrationResult {
 }
 
 type CalibPhase = "idle" | "recording" | "confirm";
+type WidgetMode = "full" | "micro";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -63,6 +79,88 @@ const clamp = (v: number, lo: number, hi: number) =>
 const pct = (v: number) =>
   clamp(((v - SCALE_MIN) / (SCALE_MAX - SCALE_MIN)) * 100, 0, 100);
 
+// ─── Micro Widget ─────────────────────────────────────────────────────────────
+// A tiny 80×80 gaming overlay: colored ring + dB readout + expand/drag handles.
+// The outer div is a drag region so the widget can be repositioned while gaming.
+
+interface MicroWidgetProps {
+  db: number;
+  threshold: number;
+  isAlerting: boolean;
+  isMuted: boolean;
+  micError: boolean;
+  onExpand: () => void;
+}
+
+function MicroWidget({ db, threshold, isAlerting, isMuted, micError, onExpand }: MicroWidgetProps) {
+  const color  = micError ? "#4b5563" : isMuted ? "#fbbf24" : barColor(db, threshold);
+  const label  = micError ? "--" : isMuted ? "—" : String(db);
+
+  return (
+    // Full window is a drag region — the expand button is interactive (Tauri skips it)
+    <div
+      data-tauri-drag-region
+      className="w-full h-full flex items-center justify-center"
+      style={{ background: "transparent" }}
+    >
+      {/* Outer ring — pulses red when alerting */}
+      <div
+        className={isAlerting ? "animate-alert-glow" : ""}
+        style={{
+          width:  72,
+          height: 72,
+          borderRadius: "50%",
+          border: `2px solid ${isAlerting ? "rgba(239,68,68,0.8)" : color + "66"}`,
+          background: isAlerting
+            ? "rgba(20,4,4,0.92)"
+            : isMuted
+            ? "rgba(10,8,4,0.92)"
+            : "rgba(8,12,20,0.92)",
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          justifyContent: "center",
+          position: "relative",
+          boxShadow: isAlerting
+            ? `0 0 16px 4px rgba(239,68,68,0.35)`
+            : `0 0 10px 2px ${color}22`,
+        }}
+      >
+        {/* dB readout */}
+        <span
+          className={["font-mono font-bold tabular-nums leading-none", isAlerting ? "animate-shake" : ""].join(" ")}
+          style={{ fontSize: 18, color, letterSpacing: "-0.03em" }}
+        >
+          {label}
+        </span>
+        <span style={{ fontSize: 8, color: "rgba(156,163,175,0.6)", letterSpacing: "0.15em", marginTop: 2 }}>
+          {micError ? "ERR" : isMuted ? "MUTE" : "dB"}
+        </span>
+
+        {/* Expand button — top-right corner, not a drag region */}
+        <button
+          onClick={onExpand}
+          aria-label="Expand to full view"
+          style={{
+            position: "absolute",
+            top: 4,
+            right: 4,
+            padding: 3,
+            borderRadius: 4,
+            background: "rgba(255,255,255,0.06)",
+            border: "1px solid rgba(255,255,255,0.1)",
+            color: "rgba(156,163,175,0.7)",
+            cursor: "pointer",
+            lineHeight: 0,
+          }}
+        >
+          <Maximize2 size={8} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export default function App() {
@@ -78,6 +176,18 @@ export default function App() {
   const [micError,     setMicError]     = useState(false);
   const [isMuted,      setIsMuted]      = useState(false);
   const [displayPeak,  setDisplayPeak]  = useState(0);
+
+  // Widget mode — "full" (dashboard) or "micro" (gaming dot)
+  const [widgetMode,   setWidgetMode]   = useState<WidgetMode>(() => {
+    return (localStorage.getItem("widget-mode") as WidgetMode) || "full";
+  });
+
+  // Device selector
+  const [devices,        setDevices]        = useState<string[]>([]);
+  const [selectedDevice, setSelectedDevice] = useState<string>(() =>
+    localStorage.getItem("selected-device") ?? ""
+  );
+  const [deviceSwitching, setDeviceSwitching] = useState(false);
 
   // Calibration
   const [calibPhase,    setCalibPhase]    = useState<CalibPhase>("idle");
@@ -100,14 +210,66 @@ export default function App() {
     localStorage.setItem("db-threshold", String(threshold));
   }, [threshold]);
 
+  // ── Fetch available input devices on mount ─────────────────────────────────
+  useEffect(() => {
+    invoke<string[]>("list_audio_devices")
+      .then(setDevices)
+      .catch(() => {});
+  }, []);
+
+  // ── Handle device switch ───────────────────────────────────────────────────
+  const handleDeviceChange = async (name: string) => {
+    setSelectedDevice(name);
+    localStorage.setItem("selected-device", name);
+    setDeviceSwitching(true);
+    setMicError(false);
+    smoothed.current = 0;
+    setDisplayDb(0);
+    peakDb.current = 0;
+    setDisplayPeak(0);
+    await invoke("set_audio_device", { name });
+    // Brief delay so the user sees the "switching" state
+    setTimeout(() => setDeviceSwitching(false), 600);
+  };
+
+  // ── Resize window when widget mode changes ─────────────────────────────────
+  useEffect(() => {
+    localStorage.setItem("widget-mode", widgetMode);
+    const win = getCurrentWindow();
+    const [w, h] = widgetMode === "micro" ? [MICRO_W, MICRO_H] : [FULL_W, FULL_H + MACOS_EXTRA_H];
+    win.setSize(new LogicalSize(w, h)).catch(() => {});
+  }, [widgetMode]);
+
   // ── Restore + persist window position ─────────────────────────────────────
   useEffect(() => {
     const win = getCurrentWindow();
+
+    // Version guard: wipe any position saved before this fix was deployed.
+    // Bump "pos-v" whenever the save format changes to force a fresh start.
+    const POS_VERSION = "3";
+    if (localStorage.getItem("pos-v") !== POS_VERSION) {
+      localStorage.removeItem("win-x");
+      localStorage.removeItem("win-y");
+      localStorage.setItem("pos-v", POS_VERSION);
+    }
+
     const sx = localStorage.getItem("win-x");
     const sy = localStorage.getItem("win-y");
     if (sx !== null && sy !== null) {
-      win.setPosition(new PhysicalPosition(Number(sx), Number(sy))).catch(() => {});
+      const x = Number(sx);
+      const y = Number(sy);
+      // Restore only if the widget fits fully on screen (logical coords × DPR).
+      const dpr  = window.devicePixelRatio || 1;
+      const maxX = (window.screen.width  - FULL_W) * dpr;
+      const maxY = (window.screen.height - FULL_H) * dpr;
+      if (x >= 0 && x <= maxX && y >= 0 && y <= maxY) {
+        win.setPosition(new PhysicalPosition(x, y)).catch(() => {});
+      } else {
+        localStorage.removeItem("win-x");
+        localStorage.removeItem("win-y");
+      }
     }
+    // If no valid saved position, the config's x:20 y:20 keeps the window visible.
     let unlistenMove: UnlistenFn | undefined;
     win.listen<{ x: number; y: number }>("tauri://move", (e) => {
       if (positionSaveRef.current) clearTimeout(positionSaveRef.current);
@@ -227,6 +389,9 @@ export default function App() {
     if (calibPhase === "recording" || micError) return;
     setCalibPhase("recording");
     setCalibProgress(0);
+    // Collapse settings and shrink window for the calibration/confirm screens
+    setShowSettings(false);
+    getCurrentWindow().setSize(new LogicalSize(FULL_W, FULL_H + MACOS_EXTRA_H)).catch(() => {});
     setPendingResult(null);
     calibStartRef.current = Date.now();
     calibIntervalRef.current = setInterval(() => {
@@ -248,7 +413,18 @@ export default function App() {
     await startCalib(mode);
   };
 
-  const closeWindow = () => getCurrentWindow().close();
+  const closeWindow = () => invoke("quit_app");
+
+  const toggleWidgetMode = () =>
+    setWidgetMode((m) => (m === "full" ? "micro" : "full"));
+
+  const toggleSettings = () => {
+    const next = !showSettings;
+    setShowSettings(next);
+    getCurrentWindow()
+      .setSize(new LogicalSize(FULL_W, next ? FULL_H_OPEN + MACOS_EXTRA_H : FULL_H + MACOS_EXTRA_H))
+      .catch(() => {});
+  };
 
   // ── Derived display values ─────────────────────────────────────────────────
   const isCalibrating = calibPhase === "recording";
@@ -265,9 +441,23 @@ export default function App() {
     Math.ceil(CALIBRATION_DURATION_MS / 1000 - (calibProgress / 100) * (CALIBRATION_DURATION_MS / 1000))
   );
 
-  // ── Render ─────────────────────────────────────────────────────────────────
+  // ── Micro widget ───────────────────────────────────────────────────────────
+  if (widgetMode === "micro") {
+    return (
+      <MicroWidget
+        db={displayDb}
+        threshold={threshold}
+        isAlerting={isAlerting}
+        isMuted={isMuted}
+        micError={micError}
+        onExpand={toggleWidgetMode}
+      />
+    );
+  }
+
+  // ── Full dashboard ─────────────────────────────────────────────────────────
   return (
-    <div data-tauri-drag-region className="w-full h-full">
+    <div className="w-full h-full">
       <div
         className={[
           "w-full select-none overflow-hidden rounded-2xl border font-mono text-sm shadow-2xl",
@@ -326,16 +516,27 @@ export default function App() {
               </button>
             )}
             {!isCalibrating && !isConfirming && (
-              <button
-                onClick={() => setShowSettings((s) => !s)}
-                aria-label="Toggle settings"
-                className={[
-                  "p-1.5 rounded-lg transition-colors",
-                  showSettings ? "bg-cyan-500/20 text-cyan-400" : "text-gray-600 hover:text-gray-300",
-                ].join(" ")}
-              >
-                <Settings size={11} />
-              </button>
+              <>
+                <button
+                  onClick={toggleSettings}
+                  aria-label="Toggle settings"
+                  className={[
+                    "p-1.5 rounded-lg transition-colors",
+                    showSettings ? "bg-cyan-500/20 text-cyan-400" : "text-gray-600 hover:text-gray-300",
+                  ].join(" ")}
+                >
+                  <Settings size={11} />
+                </button>
+                {/* Collapse to micro widget */}
+                <button
+                  onClick={toggleWidgetMode}
+                  aria-label="Collapse to micro widget"
+                  className="p-1.5 rounded-lg text-gray-600 hover:text-cyan-400 transition-colors"
+                  title="Collapse to gaming dot"
+                >
+                  <Minimize2 size={11} />
+                </button>
+              </>
             )}
             <button
               onClick={closeWindow}
@@ -543,6 +744,31 @@ export default function App() {
           ].join(" ")}
         >
           <div className="px-4 pt-2 pb-3.5 border-t space-y-3" style={{ borderColor: "rgba(255,255,255,0.06)" }}>
+
+            {/* ── Device selector ─────────────────────────────────── */}
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between">
+                <span className="text-[9px] uppercase tracking-[0.2em] text-gray-600">Input device</span>
+                {deviceSwitching && (
+                  <span className="text-[9px] text-cyan-500 animate-pulse">switching…</span>
+                )}
+              </div>
+              <select
+                value={selectedDevice}
+                onChange={(e) => handleDeviceChange(e.target.value)}
+                className="w-full rounded-lg text-[10px] font-mono px-2 py-1.5 outline-none"
+                style={{
+                  background: "rgba(255,255,255,0.05)",
+                  border: "1px solid rgba(255,255,255,0.1)",
+                  color: "#d1d5db",
+                }}
+              >
+                <option value="">System Default</option>
+                {devices.map((d) => (
+                  <option key={d} value={d}>{d}</option>
+                ))}
+              </select>
+            </div>
 
             {/* ── Manual threshold slider ──────────────────────────── */}
             <div className="space-y-1.5">

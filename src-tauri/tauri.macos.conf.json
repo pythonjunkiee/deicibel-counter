@@ -1,0 +1,12 @@
+{
+  "app": {
+    "windows": [
+      {
+        "label":  "main",
+        "y":      30,
+        "height": 338,
+        "minHeight": 64
+      }
+    ]
+  }
+}

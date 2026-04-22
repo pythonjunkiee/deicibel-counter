@@ -36,10 +36,10 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use serde::Serialize;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, State};
 
 // ─── IPC payloads ────────────────────────────────────────────────────────────
@@ -85,9 +85,14 @@ pub struct AudioState {
     pub muted: Arc<AtomicBool>,
     /// `true` while the audio capture thread has an active, playing stream.
     pub running: Arc<AtomicBool>,
+    /// When set to `true`, the audio capture loop exits cleanly so the thread
+    /// can be restarted with a different device.
+    pub stop_flag: Arc<AtomicBool>,
     /// Calibration accumulator — written by the audio thread, read by the
     /// calibration timer thread.
     pub calibration: Arc<Mutex<CalibrationState>>,
+    /// Selected input device name. `None` = OS default.
+    pub device_name: Arc<Mutex<Option<String>>>,
 }
 
 // ─── Signal processing ───────────────────────────────────────────────────────
@@ -101,7 +106,6 @@ fn rms_to_db(samples: &[f32]) -> f32 {
         return 0.0;
     }
 
-    // mean_square = (1/N) · Σ xᵢ²
     let mean_sq: f32 =
         samples.iter().map(|&x| x * x).sum::<f32>() / samples.len() as f32;
 
@@ -110,23 +114,16 @@ fn rms_to_db(samples: &[f32]) -> f32 {
         return 0.0;
     }
 
-    // dB = 20·log₁₀(RMS) + 100  (gaming-scale offset)
     let db = 20.0_f32.mul_add(rms.log10(), 100.0);
     db.clamp(0.0, 120.0)
 }
 
 // ─── Calibration algorithm ───────────────────────────────────────────────────
 
-/// Minimum dB value treated as active speech (below = silence).
 const SILENCE_FLOOR_DB: f32 = 10.0;
-
-/// Minimum active-speech samples needed for statistical validity.
 const MIN_ACTIVE_SAMPLES: usize = 10;
-
-/// Returned when not enough data is available.
 const CALIBRATION_FALLBACK_DB: f32 = 60.0;
 
-/// Internal result of `compute_threshold_stats`.
 struct ThresholdStats {
     threshold: f32,
     mean: f32,
@@ -135,38 +132,6 @@ struct ThresholdStats {
     max: f32,
 }
 
-/// Computes a recommended alert threshold from a 10-second sample set.
-///
-/// # Algorithm
-///
-/// **Step 1 — Strip silence**
-/// Discard samples ≤ `SILENCE_FLOOR_DB` so that natural speech pauses
-/// don't pull the mean down.
-///
-/// **Step 2 — Gaussian upper bound (primary path)**
-///
-/// ```text
-/// μ  = (1/N) · Σ xᵢ                    (mean)
-/// σ² = (1/N) · Σ (xᵢ − μ)²             (variance)
-/// σ  = √σ²                              (standard deviation)
-/// Threshold = μ + 1.5·σ
-/// ```
-///
-/// 1.5σ covers ≈93 % of the speaker's Gaussian distribution, so only
-/// genuine spikes above normal gaming volume trigger the alert.
-///
-/// **Step 3 — 90th-percentile fallback**
-/// When σ < 1.0 the input is essentially constant (e.g., background hiss
-/// or a pink-noise test signal).  In that case the Gaussian model is
-/// degenerate, so we fall back to:
-///
-/// ```text
-/// P₉₀ = samples_sorted[ ⌊0.90 · N⌋ ]
-/// ```
-///
-/// **Step 4 — Clamp to [40, 95] dB**
-/// Prevents pathological thresholds from muting all alerts or firing
-/// permanently.
 /// Calibration mode — controls how the threshold is derived from samples.
 ///
 /// - `Normal`: user speaks at their everyday gaming volume; threshold is set
@@ -180,7 +145,6 @@ pub enum CalibMode {
 }
 
 fn compute_threshold_stats(samples: &[f32], mode: &CalibMode) -> ThresholdStats {
-    // Step 1 — strip silence
     let active: Vec<f32> = samples
         .iter()
         .copied()
@@ -198,11 +162,7 @@ fn compute_threshold_stats(samples: &[f32], mode: &CalibMode) -> ThresholdStats 
     }
 
     let n = active.len() as f32;
-
-    // μ = (1/N) · Σ xᵢ
     let mean: f32 = active.iter().sum::<f32>() / n;
-
-    // σ = √( (1/N) · Σ (xᵢ − μ)² )
     let variance: f32 = active.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / n;
     let std_dev = variance.sqrt();
 
@@ -210,13 +170,7 @@ fn compute_threshold_stats(samples: &[f32], mode: &CalibMode) -> ThresholdStats 
     let max = active.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
     let raw_threshold = match mode {
-        // Limit mode: user spoke at the volume they want to warn at.
-        // Threshold = mean of what they recorded.
         CalibMode::Limit => mean,
-
-        // Normal mode: user spoke at everyday volume.
-        // Threshold = μ + 1.5σ  (covers ≈93% of distribution)
-        // Fallback to P₉₀ when σ < 1 (near-constant input).
         CalibMode::Normal => {
             if std_dev < 1.0 {
                 let mut sorted = active.clone();
@@ -229,7 +183,6 @@ fn compute_threshold_stats(samples: &[f32], mode: &CalibMode) -> ThresholdStats 
         }
     };
 
-    // Clamp to [40, 95] dB
     ThresholdStats {
         threshold: raw_threshold.clamp(40.0, 95.0),
         mean,
@@ -241,23 +194,29 @@ fn compute_threshold_stats(samples: &[f32], mode: &CalibMode) -> ThresholdStats 
 
 // ─── Audio capture thread ────────────────────────────────────────────────────
 
-/// Spawns a dedicated background thread that opens the default input device,
-/// matches the native sample format, and on every audio callback:
-///   - emits `"db-level"` unless muted, AND
-///   - appends the dB reading to the calibration buffer when active.
+/// Maximum rate at which dB events are emitted to the frontend.
+/// The audio callback fires ~50–200×/second depending on device buffer size.
+/// Throttling to 10 Hz caps Tauri/WebView2 IPC overhead to near-zero so the
+/// audio thread has no measurable impact on game frame times.
+/// Calibration samples are still accumulated at full rate for accuracy.
+const EMIT_INTERVAL_MS: u64 = 100;
+
+/// Spawns a dedicated background thread that opens the selected (or default)
+/// input device, matches the native sample format, and on every audio callback:
+///   - appends the dB reading to the calibration buffer (full rate), AND
+///   - emits `"db-level"` at most once per EMIT_INTERVAL_MS (10 Hz throttle).
 ///
-/// Uses `try_lock()` for the calibration mutex — the audio callback must
-/// never block waiting for a lock, as that would cause glitches.
-///
-/// Guards against double-spawn: if `running` is already `true`, returns
-/// immediately.
+/// The thread exits cleanly when `stop_flag` is set to `true`, which allows
+/// the audio device to be switched without restarting the whole app.
 pub fn start_audio_listener(
     app: AppHandle,
     muted: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
+    stop_flag: Arc<AtomicBool>,
     calibration: Arc<Mutex<CalibrationState>>,
+    device_name: Arc<Mutex<Option<String>>>,
 ) {
-    // Atomically set running = true; abort if already running.
+    // Guard against double-spawn.
     if running.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -267,8 +226,27 @@ pub fn start_audio_listener(
         .spawn(move || {
             let host = cpal::default_host();
 
-            // ── Enumerate the default microphone ─────────────────────────
-            let device = match host.default_input_device() {
+            // ── Resolve input device ──────────────────────────────────────
+            // If a device name is stored, try to match it in the host's
+            // enumerated list. Fall back to the OS default on any failure.
+            let requested = device_name.lock().unwrap().clone();
+            let device = match requested {
+                Some(ref name) => {
+                    let found = host
+                        .input_devices()
+                        .ok()
+                        .and_then(|mut devs| {
+                            devs.find(|d| d.name().map_or(false, |n| n == *name))
+                        });
+                    if found.is_none() {
+                        eprintln!("[dB Meter] Device '{}' not found, falling back to default.", name);
+                    }
+                    found.or_else(|| host.default_input_device())
+                }
+                None => host.default_input_device(),
+            };
+
+            let device = match device {
                 Some(d) => d,
                 None => {
                     eprintln!("[dB Meter] No microphone found.");
@@ -289,31 +267,41 @@ pub fn start_audio_listener(
             };
 
             eprintln!(
-                "[dB Meter] Device: {:?}  format: {:?}  rate: {} Hz",
+                "[dB Meter] Device: {:?}  format: {:?}  rate: {} Hz  emit_interval: {}ms",
                 device.name().unwrap_or_default(),
                 supported.sample_format(),
                 supported.sample_rate().0,
+                EMIT_INTERVAL_MS,
             );
 
             let app = Arc::new(app);
 
-            // ── Macro: emit dB + optionally record for calibration ───────
-            //
-            // Defined as a local closure to avoid copy-pasting across the
-            // three format branches below.  Takes the computed dB value,
-            // emits the event (unless muted), and tries to append to the
-            // calibration buffer using try_lock — never blocking.
+            // ── Emit throttle ─────────────────────────────────────────────
+            // Lock-free AtomicU64 tracks ms since thread start.
+            // An occasional double-emit on a benign race is harmless.
+            let audio_start  = Instant::now();
+            let last_emit_ms = Arc::new(AtomicU64::new(0));
+
+            // ── Macro: calibration buffer + throttled IPC emit ────────────
             macro_rules! on_db {
-                ($app:expr, $muted:expr, $cal:expr, $db:expr) => {{
+                ($app:expr, $muted:expr, $cal:expr, $last:expr, $start:expr, $db:expr) => {{
                     let db: f32 = $db;
-                    if !$muted.load(Ordering::Relaxed) {
-                        let _ = $app.emit("db-level", DbPayload { db });
-                    }
-                    // try_lock: skip this sample if the calibration thread
-                    // holds the mutex — one missed frame is harmless.
+
+                    // Always push to calibration buffer at full rate (try_lock —
+                    // never block the real-time audio callback).
                     if let Ok(mut cal) = $cal.try_lock() {
                         if cal.active {
                             cal.samples.push(db);
+                        }
+                    }
+
+                    // Throttled IPC: emit at most 10×/second.
+                    if !$muted.load(Ordering::Relaxed) {
+                        let now_ms = $start.elapsed().as_millis() as u64;
+                        let last   = $last.load(Ordering::Relaxed);
+                        if now_ms.saturating_sub(last) >= EMIT_INTERVAL_MS {
+                            $last.store(now_ms, Ordering::Relaxed);
+                            let _ = $app.emit("db-level", DbPayload { db });
                         }
                     }
                 }};
@@ -322,17 +310,21 @@ pub fn start_audio_listener(
             // ── Build a stream matching the device's native format ────────
             let stream_result = match supported.sample_format() {
 
-                // ── F32 — already normalised ──────────────────────────────
-                cpal::SampleFormat::F32 => {
+                // ── F64 — CoreAudio on macOS sometimes reports this ──────
+                cpal::SampleFormat::F64 => {
                     let app_cb      = Arc::clone(&app);
                     let muted_cb    = Arc::clone(&muted);
                     let cal_cb      = Arc::clone(&calibration);
+                    let last_cb     = Arc::clone(&last_emit_ms);
+                    let start_cb    = audio_start;
                     let running_err = Arc::clone(&running);
                     let app_err     = Arc::clone(&app);
                     device.build_input_stream(
                         &supported.into(),
-                        move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                            on_db!(app_cb, muted_cb, cal_cb, rms_to_db(data));
+                        move |data: &[f64], _: &cpal::InputCallbackInfo| {
+                            let floats: Vec<f32> =
+                                data.iter().map(|&s| s as f32).collect();
+                            on_db!(app_cb, muted_cb, cal_cb, last_cb, start_cb, rms_to_db(&floats));
                         },
                         move |e| {
                             eprintln!("[dB Meter] Stream error: {e}");
@@ -343,11 +335,61 @@ pub fn start_audio_listener(
                     )
                 }
 
-                // ── I16 — normalise to [-1.0, 1.0] ───────────────────────
+                // ── I32 — CoreAudio + some WASAPI devices ─────────────────
+                cpal::SampleFormat::I32 => {
+                    let app_cb      = Arc::clone(&app);
+                    let muted_cb    = Arc::clone(&muted);
+                    let cal_cb      = Arc::clone(&calibration);
+                    let last_cb     = Arc::clone(&last_emit_ms);
+                    let start_cb    = audio_start;
+                    let running_err = Arc::clone(&running);
+                    let app_err     = Arc::clone(&app);
+                    device.build_input_stream(
+                        &supported.into(),
+                        move |data: &[i32], _: &cpal::InputCallbackInfo| {
+                            let floats: Vec<f32> = data
+                                .iter()
+                                .map(|&s| s as f32 / i32::MAX as f32)
+                                .collect();
+                            on_db!(app_cb, muted_cb, cal_cb, last_cb, start_cb, rms_to_db(&floats));
+                        },
+                        move |e| {
+                            eprintln!("[dB Meter] Stream error: {e}");
+                            running_err.store(false, Ordering::SeqCst);
+                            let _ = app_err.emit("mic-error", ());
+                        },
+                        None,
+                    )
+                }
+
+                cpal::SampleFormat::F32 => {
+                    let app_cb      = Arc::clone(&app);
+                    let muted_cb    = Arc::clone(&muted);
+                    let cal_cb      = Arc::clone(&calibration);
+                    let last_cb     = Arc::clone(&last_emit_ms);
+                    let start_cb    = audio_start;
+                    let running_err = Arc::clone(&running);
+                    let app_err     = Arc::clone(&app);
+                    device.build_input_stream(
+                        &supported.into(),
+                        move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                            on_db!(app_cb, muted_cb, cal_cb, last_cb, start_cb, rms_to_db(data));
+                        },
+                        move |e| {
+                            eprintln!("[dB Meter] Stream error: {e}");
+                            running_err.store(false, Ordering::SeqCst);
+                            let _ = app_err.emit("mic-error", ());
+                        },
+                        None,
+                    )
+                }
+
                 cpal::SampleFormat::I16 => {
                     let app_cb      = Arc::clone(&app);
                     let muted_cb    = Arc::clone(&muted);
                     let cal_cb      = Arc::clone(&calibration);
+                    let last_cb     = Arc::clone(&last_emit_ms);
+                    let start_cb    = audio_start;
                     let running_err = Arc::clone(&running);
                     let app_err     = Arc::clone(&app);
                     device.build_input_stream(
@@ -357,7 +399,7 @@ pub fn start_audio_listener(
                                 .iter()
                                 .map(|&s| s as f32 / i16::MAX as f32)
                                 .collect();
-                            on_db!(app_cb, muted_cb, cal_cb, rms_to_db(&floats));
+                            on_db!(app_cb, muted_cb, cal_cb, last_cb, start_cb, rms_to_db(&floats));
                         },
                         move |e| {
                             eprintln!("[dB Meter] Stream error: {e}");
@@ -368,11 +410,12 @@ pub fn start_audio_listener(
                     )
                 }
 
-                // ── U16 — unsigned, centre at 32 768 ─────────────────────
                 cpal::SampleFormat::U16 => {
                     let app_cb      = Arc::clone(&app);
                     let muted_cb    = Arc::clone(&muted);
                     let cal_cb      = Arc::clone(&calibration);
+                    let last_cb     = Arc::clone(&last_emit_ms);
+                    let start_cb    = audio_start;
                     let running_err = Arc::clone(&running);
                     let app_err     = Arc::clone(&app);
                     device.build_input_stream(
@@ -382,7 +425,7 @@ pub fn start_audio_listener(
                                 .iter()
                                 .map(|&s| (s as f32 - 32_768.0) / 32_768.0)
                                 .collect();
-                            on_db!(app_cb, muted_cb, cal_cb, rms_to_db(&floats));
+                            on_db!(app_cb, muted_cb, cal_cb, last_cb, start_cb, rms_to_db(&floats));
                         },
                         move |e| {
                             eprintln!("[dB Meter] Stream error: {e}");
@@ -411,9 +454,14 @@ pub fn start_audio_listener(
                         return;
                     }
                     eprintln!("[dB Meter] Audio stream running.");
-                    // Park indefinitely — `stream` must stay alive.
-                    std::thread::park();
+                    // Poll stop_flag every 50ms. This lets the device-switch
+                    // command cleanly stop this thread before starting a new one.
+                    while !stop_flag.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
                     drop(stream);
+                    running.store(false, Ordering::SeqCst);
+                    eprintln!("[dB Meter] Audio stream stopped.");
                 }
                 Err(e) => {
                     eprintln!("[dB Meter] Failed to build stream: {e}");
@@ -443,8 +491,64 @@ fn retry_audio(app: AppHandle, state: State<AudioState>) {
         app,
         Arc::clone(&state.muted),
         Arc::clone(&state.running),
+        Arc::clone(&state.stop_flag),
         Arc::clone(&state.calibration),
+        Arc::clone(&state.device_name),
     );
+}
+
+/// Returns the names of all available audio input devices.
+/// The frontend uses this to populate the device selector.
+/// An empty string in the returned list is never emitted — the frontend
+/// adds its own "System Default" entry that maps to an empty invoke arg.
+#[tauri::command]
+fn list_audio_devices() -> Vec<String> {
+    let host = cpal::default_host();
+    match host.input_devices() {
+        Ok(devices) => devices.filter_map(|d| d.name().ok()).collect(),
+        Err(_) => vec![],
+    }
+}
+
+/// Switch to a different audio input device without restarting the app.
+///
+/// Pass an empty string to revert to the OS default device.
+///
+/// Internally: sets the stop flag so the current audio thread exits cleanly,
+/// waits up to 300ms for it to finish, then restarts the listener with the
+/// new device.  This is done on a background thread so the command returns
+/// immediately without blocking the Tauri event loop.
+#[tauri::command]
+fn set_audio_device(app: AppHandle, state: State<AudioState>, name: String) {
+    // Store the new device preference.
+    {
+        let mut dev = state.device_name.lock().unwrap();
+        *dev = if name.is_empty() { None } else { Some(name.clone()) };
+    }
+    eprintln!("[dB Meter] Switching device → {}", if name.is_empty() { "System Default" } else { &name });
+
+    // Signal the current audio thread to stop.
+    state.stop_flag.store(true, Ordering::SeqCst);
+
+    // Clone everything needed to restart on a helper thread.
+    let muted       = Arc::clone(&state.muted);
+    let running     = Arc::clone(&state.running);
+    let stop_flag   = Arc::clone(&state.stop_flag);
+    let calibration = Arc::clone(&state.calibration);
+    let device_name = Arc::clone(&state.device_name);
+
+    std::thread::spawn(move || {
+        // Wait for the old audio thread to set running=false (max 300ms).
+        for _ in 0..6 {
+            std::thread::sleep(Duration::from_millis(50));
+            if !running.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+        // Clear stop flag and launch the new stream.
+        stop_flag.store(false, Ordering::SeqCst);
+        start_audio_listener(app, muted, running, stop_flag, calibration, device_name);
+    });
 }
 
 /// Start a 10-second auto-calibration window.
@@ -455,7 +559,6 @@ fn retry_audio(app: AppHandle, state: State<AudioState>) {
 /// **Debounce:** calling while a calibration is in progress is a no-op.
 #[tauri::command]
 fn start_calibration(app: AppHandle, state: State<AudioState>, mode: String) {
-    // ── Debounce / arm the collection window ─────────────────────────────
     {
         let mut cal = state.calibration.lock().unwrap();
         if cal.active {
@@ -468,7 +571,6 @@ fn start_calibration(app: AppHandle, state: State<AudioState>, mode: String) {
     let calibration = Arc::clone(&state.calibration);
     let calib_mode = if mode == "limit" { CalibMode::Limit } else { CalibMode::Normal };
 
-    // ── Timer thread — sleeps 10 s, reads samples, emits result ──────────
     std::thread::Builder::new()
         .name("db-calibration-timer".into())
         .spawn(move || {
@@ -502,31 +604,47 @@ fn start_calibration(app: AppHandle, state: State<AudioState>, mode: String) {
         .expect("Failed to spawn calibration timer thread");
 }
 
+/// Quit the application entirely on all platforms.
+///
+/// `getCurrentWindow().close()` in the frontend only hides the window on
+/// macOS — the process stays alive in the Dock. Calling `app.exit(0)` from
+/// Rust guarantees the process terminates on every OS.
+#[tauri::command]
+fn quit_app(app: AppHandle) {
+    app.exit(0);
+}
+
 // ─── App entry point ─────────────────────────────────────────────────────────
 
-/// Called by `main.rs`.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let muted       = Arc::new(AtomicBool::new(false));
     let running     = Arc::new(AtomicBool::new(false));
+    let stop_flag   = Arc::new(AtomicBool::new(false));
     let calibration = Arc::new(Mutex::new(CalibrationState {
         active:  false,
         samples: Vec::new(),
     }));
+    let device_name = Arc::new(Mutex::new(None::<String>));
 
     tauri::Builder::default()
         .manage(AudioState {
             muted:       Arc::clone(&muted),
             running:     Arc::clone(&running),
+            stop_flag:   Arc::clone(&stop_flag),
             calibration: Arc::clone(&calibration),
+            device_name: Arc::clone(&device_name),
         })
         .invoke_handler(tauri::generate_handler![
             toggle_mute,
             retry_audio,
+            list_audio_devices,
+            set_audio_device,
             start_calibration,
+            quit_app,
         ])
         .setup(move |app| {
-            start_audio_listener(app.handle().clone(), muted, running, calibration);
+            start_audio_listener(app.handle().clone(), muted, running, stop_flag, calibration, device_name);
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -538,8 +656,6 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{compute_threshold_stats, rms_to_db, CalibMode, CALIBRATION_FALLBACK_DB};
-
-    // ── rms_to_db ────────────────────────────────────────────────────────────
 
     #[test]
     fn silence_returns_zero() {
@@ -553,15 +669,12 @@ mod tests {
 
     #[test]
     fn dc_full_scale_is_100_db() {
-        // DC at amplitude 1.0 → RMS = 1.0 → 20·log₁₀(1) + 100 = 100 dB
         let db = rms_to_db(&[1.0_f32; 256]);
         assert!((db - 100.0).abs() < 0.01, "expected 100 dB, got {db}");
     }
 
     #[test]
     fn full_scale_sine_near_97_db() {
-        // Full-scale sine has RMS = 1/√2 ≈ 0.707.
-        // Expected: 20·log₁₀(0.707) + 100 ≈ 96.99 dB
         let samples: Vec<f32> = (0..1024)
             .map(|i| (2.0 * std::f32::consts::PI * i as f32 / 64.0).sin())
             .collect();
@@ -587,8 +700,6 @@ mod tests {
         assert!(db >= 0.0 && db <= 120.0);
     }
 
-    // ── compute_threshold_stats ──────────────────────────────────────────────
-
     #[test]
     fn empty_samples_returns_fallback() {
         let stats = compute_threshold_stats(&[], &CalibMode::Normal);
@@ -604,7 +715,6 @@ mod tests {
 
     #[test]
     fn normal_mode_threshold_above_mean() {
-        // Normal mode: threshold = μ + 1.5σ, must be above mean
         let samples: Vec<f32> = (0..500)
             .map(|i| 65.0 + 5.0 * ((i as f32 * 0.1).sin()))
             .collect();
@@ -615,7 +725,6 @@ mod tests {
 
     #[test]
     fn limit_mode_threshold_equals_mean() {
-        // Limit mode: user spoke at their limit level — threshold = mean
         let samples: Vec<f32> = (0..500)
             .map(|i| 75.0 + 3.0 * ((i as f32 * 0.1).sin()))
             .collect();
@@ -626,7 +735,6 @@ mod tests {
 
     #[test]
     fn constant_input_uses_percentile_fallback() {
-        // Constant 70 dB → σ = 0 < 1.0 → normal mode uses P₉₀ = 70.0
         let samples = vec![70.0_f32; 200];
         let stats = compute_threshold_stats(&samples, &CalibMode::Normal);
         assert!((stats.threshold - 70.0).abs() < 1.0, "expected ~70 dB, got {}", stats.threshold);
