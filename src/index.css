@@ -20,10 +20,17 @@ body,
   user-select: none;
 }
 
-/* Desktop overlay: must be transparent so the Tauri window shows through.
-   Android sets its own opaque background in the React component. */
+/* Desktop overlay: must be transparent so the Tauri window shows through. */
 .tauri-desktop {
   background: transparent !important;
+}
+
+/* Android / non-desktop: explicit dark background so the WebView never
+   bleeds white behind the React content (default WebView bg is white). */
+html:not(.tauri-desktop),
+html:not(.tauri-desktop) body,
+html:not(.tauri-desktop) #root {
+  background: #0a0c14;
 }
 
 /* ── Alert glow animation ────────────────────────────────────────────────── */

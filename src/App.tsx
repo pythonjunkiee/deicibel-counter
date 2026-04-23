@@ -386,6 +386,34 @@ export default function App() {
     return () => { unlistenCalib?.(); };
   }, []);
 
+  // ── Android: auto-retry audio 3 s after mount ──────────────────────────────
+  // The Rust audio stream starts before Android shows the mic-permission dialog.
+  // If cpal fails (permission not yet granted) it emits "mic-error". A 3-second
+  // delayed retry gives the user time to tap Allow on the OS dialog.
+  useEffect(() => {
+    if (!IS_ANDROID) return;
+    const t = setTimeout(() => {
+      setMicError(false);
+      invoke("retry_audio").catch(() => {});
+    }, 3000);
+    return () => clearTimeout(t);
+  }, []);
+
+  // ── Retry audio when app regains visibility ────────────────────────────────
+  // Covers: user returns from the Android permission dialog, or the macOS
+  // mic-permission sheet is dismissed. Both platforms hide/show the page.
+  useEffect(() => {
+    if (!IS_ANDROID && !IS_MACOS) return;
+    const onVisible = () => {
+      if (document.visibilityState === "visible") {
+        setMicError(false);
+        setTimeout(() => invoke("retry_audio").catch(() => {}), 500);
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, []);
+
   // ── Action handlers ────────────────────────────────────────────────────────
 
   const handleMuteToggle = async () => {
@@ -482,7 +510,7 @@ export default function App() {
       <div
         className="flex flex-col w-screen font-mono select-none"
         style={{
-          minHeight: "100dvh",
+          minHeight: "100vh",
           background:
             isAlerting && !isCalibrating && !isConfirming
               ? "rgba(20,8,8,1)"
@@ -519,6 +547,17 @@ export default function App() {
                 className={["p-2 rounded-xl transition-colors", isMuted ? "bg-amber-500/20 text-amber-400" : "text-gray-500 hover:text-gray-300"].join(" ")}
               >
                 {isMuted ? <VolumeX size={18} /> : <Volume2 size={18} />}
+              </button>
+            )}
+            {/* Float Mode: minimize the app window, which triggers the PiP
+                onUserLeaveHint() hook → app shrinks to a small floating overlay */}
+            {!isCalibrating && !isConfirming && (
+              <button
+                onClick={() => getCurrentWindow().minimize().catch(() => {})}
+                title="Float over other apps"
+                className="p-2 rounded-xl transition-colors text-gray-500 hover:text-gray-300"
+              >
+                <Minimize2 size={18} />
               </button>
             )}
             {!isCalibrating && !isConfirming && (
