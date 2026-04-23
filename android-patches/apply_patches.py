@@ -155,19 +155,27 @@ HELPER_METHODS = """
         }
     }
 
-    // Walk the view tree to find Tauri's WebView and call retry_audio.
+    // Walk the view tree to find Tauri's WebView and dispatch a CustomEvent.
+    // The React layer listens for "db-meter-mic-granted" and calls retry_audio
+    // via the proper Tauri invoke() path — this avoids relying on any internal
+    // Tauri globals (e.g. __TAURI_INTERNALS__) that are not part of the public
+    // API and may not be initialised when evaluateJavascript is called.
     private fun retryAudioViaJs() {
-        fun findWv(v: android.view.View): WebView? {
-            if (v is WebView) return v
-            if (v is ViewGroup) for (i in 0 until v.childCount) {
-                findWv(v.getChildAt(i))?.let { return it }
+        try {
+            fun findWv(v: android.view.View): WebView? {
+                if (v is WebView) return v
+                if (v is ViewGroup) for (i in 0 until v.childCount) {
+                    findWv(v.getChildAt(i))?.let { return it }
+                }
+                return null
             }
-            return null
+            findWv(window.decorView)?.evaluateJavascript(
+                "document.dispatchEvent(new CustomEvent('db-meter-mic-granted'))",
+                null,
+            )
+        } catch (e: Exception) {
+            android.util.Log.w("DbMeter", "retryAudioViaJs: ${e.message}")
         }
-        findWv(window.decorView)?.evaluateJavascript(
-            "window.__TAURI_INTERNALS__?.invoke('retry_audio').catch(()=>{})",
-            null,
-        )
     }
 
     private fun startDbMeterService() {

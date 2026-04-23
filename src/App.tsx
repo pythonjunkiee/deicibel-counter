@@ -386,32 +386,57 @@ export default function App() {
     return () => { unlistenCalib?.(); };
   }, []);
 
-  // ── Android: auto-retry audio 3 s after mount ──────────────────────────────
-  // The Rust audio stream starts before Android shows the mic-permission dialog.
-  // If cpal fails (permission not yet granted) it emits "mic-error". A 3-second
-  // delayed retry gives the user time to tap Allow on the OS dialog.
+  // ── Android: auto-retry audio 5 s after mount ──────────────────────────────
+  // cpal starts before Android shows the mic-permission dialog and fails with
+  // mic-error. 5 seconds gives even slow devices time for the user to tap Allow.
+  // The onRequestPermissionsResult Kotlin callback provides the precise signal;
+  // this is a belt-and-suspenders fallback.
   useEffect(() => {
     if (!IS_ANDROID) return;
     const t = setTimeout(() => {
       setMicError(false);
       invoke("retry_audio").catch(() => {});
-    }, 3000);
+    }, 5000);
     return () => clearTimeout(t);
   }, []);
 
-  // ── Retry audio when app regains visibility ────────────────────────────────
-  // Covers: user returns from the Android permission dialog, or the macOS
-  // mic-permission sheet is dismissed. Both platforms hide/show the page.
+  // ── Android: precise retry when Kotlin signals mic permission was granted ──
+  // apply_patches.py injects onRequestPermissionsResult into MainActivity.
+  // When RECORD_AUDIO is granted, Kotlin dispatches a CustomEvent so the React
+  // layer can call retry_audio via the proper Tauri invoke path — no dependency
+  // on Tauri internals globals (__TAURI_INTERNALS__ is not guaranteed to exist).
+  useEffect(() => {
+    if (!IS_ANDROID) return;
+    const handler = () => {
+      setMicError(false);
+      invoke("retry_audio").catch(() => {});
+    };
+    document.addEventListener("db-meter-mic-granted", handler);
+    return () => document.removeEventListener("db-meter-mic-granted", handler);
+  }, []);
+
+  // ── Retry audio when app regains visibility / focus ────────────────────────
+  // Android: page becomes visible again after permission dialog is dismissed.
+  // macOS:   window gets focus back after the system mic-permission sheet closes
+  //          (the sheet is a separate OS process that steals focus temporarily).
+  // retry_audio is a no-op if the stream is already running, so this is safe.
   useEffect(() => {
     if (!IS_ANDROID && !IS_MACOS) return;
+    const retry = () => { invoke("retry_audio").catch(() => {}); };
     const onVisible = () => {
       if (document.visibilityState === "visible") {
         setMicError(false);
-        setTimeout(() => invoke("retry_audio").catch(() => {}), 500);
+        setTimeout(retry, 500);
       }
     };
     document.addEventListener("visibilitychange", onVisible);
-    return () => document.removeEventListener("visibilitychange", onVisible);
+    // macOS only: also listen for window focus so the retry fires the moment
+    // the permission sheet is dismissed and the Tauri window regains focus.
+    if (IS_MACOS) window.addEventListener("focus", retry);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      if (IS_MACOS) window.removeEventListener("focus", retry);
+    };
   }, []);
 
   // ── Action handlers ────────────────────────────────────────────────────────
