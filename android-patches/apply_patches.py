@@ -77,14 +77,16 @@ def patch_manifest(path: str) -> None:
     if feature not in content:
         content = content.replace("    <application", f"    {feature}\n    <application", 1)
 
-    # Enable Picture-in-Picture on the main activity
+    # Enable Picture-in-Picture on the main activity.
+    # Note: Tauri already generates android:configChanges on the activity —
+    # injecting a second one creates duplicate XML attributes which breaks the
+    # manifest merger. Only add supportsPictureInPicture.
     if "supportsPictureInPicture" not in content:
         content = content.replace(
             'android:name=".MainActivity"',
             (
                 'android:name=".MainActivity"\n'
-                '            android:supportsPictureInPicture="true"\n'
-                '            android:configChanges="screenSize|smallestScreenSize|screenLayout|orientation"'
+                '            android:supportsPictureInPicture="true"'
             ),
         )
 
