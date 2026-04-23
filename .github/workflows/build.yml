@@ -104,15 +104,25 @@ jobs:
 
       - uses: android-actions/setup-android@v3
 
-      - name: Install Android NDK
-        run: sdkmanager "ndk;26.1.10909125"
+      - name: Pin NDK to 26 (remove auto-installed newer NDK that breaks cpal/OpenSLES)
+        run: |
+          sdkmanager "ndk;26.1.10909125"
+          # Delete any other NDK versions so Tauri CLI can't auto-detect them
+          for d in "$ANDROID_HOME/ndk"/*/; do
+            ver=$(basename "$d")
+            if [ "$ver" != "26.1.10909125" ]; then
+              rm -rf "$d"
+            fi
+          done
+          # Export via GITHUB_ENV so all subsequent steps inherit these
+          echo "NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125"       >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/26.1.10909125" >> $GITHUB_ENV
 
       - run: npm ci
 
       - name: Init Android project
         run: npm run tauri android init
-        env:
-          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/26.1.10909125
 
       - name: Apply Android patches
         # Injects all permissions, PiP config, runtime permission requests,
@@ -121,8 +131,6 @@ jobs:
 
       - name: Build APK (debug — no keystore needed)
         run: npm run tauri android build -- --debug
-        env:
-          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/26.1.10909125
 
       - name: Locate and copy APK to known path
         run: |
