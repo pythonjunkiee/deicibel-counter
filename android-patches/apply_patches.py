@@ -61,7 +61,6 @@ def patch_manifest(path: str) -> None:
         "android.permission.MODIFY_AUDIO_SETTINGS",
         "android.permission.FOREGROUND_SERVICE",
         "android.permission.POST_NOTIFICATIONS",
-        "android.permission.SYSTEM_ALERT_WINDOW",
     ]
 
     for perm in permissions:
@@ -108,10 +107,12 @@ IMPORTS_TO_ADD = """\
 import android.app.PictureInPictureParams
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Build
-import android.provider.Settings
+import android.os.Handler
+import android.os.Looper
 import android.util.Rational
+import android.view.ViewGroup
+import android.webkit.WebView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat"""
 
@@ -119,8 +120,6 @@ ONCREATE_INJECTION = """\
 
         // Request microphone access (required for cpal/Oboe on Android)
         requestMicPermission()
-        // Ask for SYSTEM_ALERT_WINDOW so the app can float over games
-        requestOverlayPermission()
         // Start foreground service — keeps audio alive when app is minimised
         startDbMeterService()"""
 
@@ -140,14 +139,35 @@ HELPER_METHODS = """
         }
     }
 
-    private fun requestOverlayPermission() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
-            val intent = Intent(
-                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                Uri.parse("package:$packageName"),
-            )
-            startActivity(intent)
+    // Called by Android after the user taps Allow/Deny on the permission dialog.
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 1001) {
+            val idx = permissions.indexOf(android.Manifest.permission.RECORD_AUDIO)
+            if (idx >= 0 && grantResults.getOrElse(idx) { -1 } == PackageManager.PERMISSION_GRANTED) {
+                // Mic just granted — tell the Tauri audio thread to retry via JS.
+                Handler(Looper.getMainLooper()).postDelayed({ retryAudioViaJs() }, 600)
+            }
         }
+    }
+
+    // Walk the view tree to find Tauri's WebView and call retry_audio.
+    private fun retryAudioViaJs() {
+        fun findWv(v: android.view.View): WebView? {
+            if (v is WebView) return v
+            if (v is ViewGroup) for (i in 0 until v.childCount) {
+                findWv(v.getChildAt(i))?.let { return it }
+            }
+            return null
+        }
+        findWv(window.decorView)?.evaluateJavascript(
+            "window.__TAURI_INTERNALS__?.invoke('retry_audio').catch(()=>{})",
+            null,
+        )
     }
 
     private fun startDbMeterService() {
@@ -160,7 +180,8 @@ HELPER_METHODS = """
     }
 
     // ── Picture-in-Picture ────────────────────────────────────────────────────
-    // Called when user presses the Home button — shrink to floating pip window.
+    // Triggered when the user presses Home or taps the Float button (minimize).
+    // The app shrinks to a small floating window that overlays any other app.
 
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
