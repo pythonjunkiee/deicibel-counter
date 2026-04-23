@@ -2,19 +2,15 @@
   "app": {
     "windows": [
       {
-        "label":       "main",
-        "title":       "dB Meter",
-        "fullscreen":  true,
-        "resizable":   true,
-        "decorations": false,
-        "transparent": false,
-        "alwaysOnTop": false
+        "label":      "main",
+        "title":      "dB Meter",
+        "fullscreen": true
       }
     ]
   },
   "bundle": {
     "android": {
-      "minSdkVersion": 26
+      "minSdkVersion": 24
     }
   }
 }

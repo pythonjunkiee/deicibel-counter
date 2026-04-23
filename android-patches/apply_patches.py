@@ -60,7 +60,6 @@ def patch_manifest(path: str) -> None:
         "android.permission.RECORD_AUDIO",
         "android.permission.MODIFY_AUDIO_SETTINGS",
         "android.permission.FOREGROUND_SERVICE",
-        "android.permission.FOREGROUND_SERVICE_MICROPHONE",
         "android.permission.POST_NOTIFICATIONS",
         "android.permission.SYSTEM_ALERT_WINDOW",
     ]
@@ -94,7 +93,6 @@ def patch_manifest(path: str) -> None:
         service_xml = (
             "\n        <service\n"
             '            android:name=".DbMeterService"\n'
-            '            android:foregroundServiceType="microphone"\n'
             '            android:exported="false" />'
         )
         content = content.replace("    </application>", service_xml + "\n    </application>")
